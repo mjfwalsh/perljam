@@ -1,0 +1,917 @@
+#!/usr/bin/perl -w
+
+# core modules
+use strict;
+use File::Copy;
+use Cwd qw{getcwd abs_path};
+use IPC::Open3;
+use File::Temp ();
+
+# other modules
+use File::Which ();
+
+# In Windows the open3 command does not do CRLF to LF transition like open does
+$/ = "\r\n" if $^O eq 'MSWin32';
+
+# Load Win32 on windows systems
+BEGIN { require Win32 if $^O eq 'MSWin32'; }
+
+# setup some control variables
+my $version = '0.0';
+my %pdf = ();
+my @input_files;
+my %package_options;
+
+# default values
+my %opt = (
+batch => 0,
+crop => 0,
+tidy => 1,
+keepinfo => 0,
+checkfiles => 0,
+suffix => 'perljam',
+preamble => '',
+out => getcwd(), # output to current working directory by default
+paper => 'a4paper',
+verbose => 1,
+landscape => 0,
+twoside => 0,
+margin => '0',
+);
+
+# default binary names depend on operating system
+if($^O =~ /mswin32/i) {
+	$opt{ghostscript} = 'gswin32c.exe';
+	$opt{pdflatex} = 'pdflatex.exe';
+	$opt{pdfinfo} = 'pdfinfo.exe';
+	$opt{kpsewhich} = 'kpsewhich.exe';
+	$opt{file} = 'file.exe';
+} else {
+	$opt{ghostscript} = 'gs';
+	$opt{pdflatex} = 'pdflatex';
+	$opt{pdfinfo} = 'pdfinfo';
+	$opt{kpsewhich} = 'kpsewhich';
+	$opt{file} = 'file';
+}
+
+############################################################
+### Process command line options and configuration files ###
+############################################################
+
+print "Processing command args..." if $opt{verbose};
+
+my $param_guide = parse_param_index(
+qw{help|h! version|v! out|outfile|o},
+
+# programs
+qw{ghostscript|gs pdflatex pdfinfo kpsewhich file},
+
+# pdf info
+qw{author|pdfauthor keywords|pdfkeywords subject|pdfsubject title|pdftitle},
+
+# pairs
+qw{quiet|q!verbose verbose! portrait!landscape landscape! oneside!twoside twoside!},
+
+# package options
+qw{final! draft! enable-survey!},
+
+# paper
+qw{paper|papersize a4paper=v:paper a5paper=v:paper b5paper=v:paper
+letterpaper|letter=v:paper executivepaper|executive=v:paper legalpaper|legal=v:paper
+a0paper=v:paper a1paper=v:paper a2paper=v:paper a3paper=v:paper a6paper=v:paper
+b0paper=v:paper b1paper=v:paper b2paper=v:paper b3paper=v:paper b4paper=v:paper
+b6paper=v:paper},
+
+# misc
+qw{batch! checkfiles! keepinfo! tidy! vanilla! crop!
+configpath preamble suffix pagecolor configfile margin},
+);
+
+my $args = process_args_from_cmd_line($param_guide);
+
+if($args->{help}) {
+	print_help();
+	exit;
+}
+
+if($args->{version}) {
+	print "Version: $version\n";
+	exit;
+}
+
+# check vanilla
+if(!$args->{vanilla} && defined $ENV{PERLJAMCONFIG}) {
+	my @configfiles = grep { -f } split(/:/, $ENV{PERLJAMCONFIGFILE});
+	if($#configfiles > -1) {
+		my $file_args = process_args_from_file($param_guide, @configfiles);
+		# now merge hashes: cmd_args wallop file_args
+		$args = [%$file_args, %$args];
+	}
+}
+
+# avoid having to write paper after known paper types
+if($args->{paper} && $args->{paper} =~ m/^([a-zA-Z][0-9]|letter|executive|legal)$/) {
+	$args->{paper} .= 'paper';
+}
+
+# split into two groups
+while(my($key, $value) = each %$args) {
+	if(!defined $value) { $value = ''; }
+
+	if(defined $param_guide->{$key}) {
+		$opt{$key} = $value;
+	} else {
+		$key =~ s/2$/\*/;
+		$pdf{$key} = $value;
+	}
+}
+
+print "done\n" if $opt{verbose};
+
+#########################################
+### Process input files and selectors ###
+#########################################
+
+print "Processing input files..." if $opt{verbose};
+
+while(my $arg = shift @ARGV) {
+	if(-f $arg || -l $arg) {
+		# get absolute path
+		$arg = safe_abs_path($arg);
+	} elsif($arg eq 'stdin' || $arg eq '-') {
+		# nothing
+	} else {
+		die "$arg does not exist\n";
+	}
+
+	my $file = {source => $arg};
+
+	if($#ARGV > -1 && $ARGV[0] =~ m/^[,0-9\{\}\-last]+$/ && !-e $ARGV[0]) {
+		$file->{pages} = shift @ARGV;
+		$file->{selector} = parse_selector($file->{pages});
+	}
+
+	push @input_files, $file;
+}
+die "No input files! Quitting\n" if $#input_files < 0;
+
+if($opt{batch} == 1 && $#input_files == 0) {
+	# Not much point in batch mode with only one input file
+	$opt{batch} = 0;
+}
+
+print "done\n" if $opt{verbose};
+
+#########################################
+### Check output file/location        ###
+#########################################
+
+print "Processing files and selectors..." if $opt{verbose};
+
+$opt{out} = safe_abs_path($opt{out});
+if(-d $opt{out}) {
+	die "Cannot write to output directory: $opt{out}\n" if !-w $opt{out};
+} elsif(-e $opt{out}) {
+	die "Output file already exists\n";
+} elsif($opt{batch} || $opt{out} =~ m|/$|) {
+	mkdir $opt{out} || die "Failed to create output directory: $opt{out}\n";
+} elsif($opt{out} =~ m|^(.*/)([^/]+)$| && -d $1) {
+	die "Cannot write to output location: $1\n" if !-w $1;
+} else {
+	die "Failed to understand --out|-o\n";
+}
+
+print "done\n" if $opt{verbose};
+
+############################################################################
+### Get full paths for executables or check that they are in the path    ###
+### Die if we don't have pdflatex and kpsewhich as we need these to work ###
+############################################################################
+
+print "Checking executables..." if $opt{verbose};
+
+foreach my $exec (qw{ghostscript pdflatex pdfinfo kpsewhich file}) {
+	if(-f $opt{$exec}) {
+		$opt{$exec} = safe_abs_path($opt{$exec});
+	} else {
+		$opt{$exec} = check_path($opt{$exec});
+	}
+}
+
+die "\nFailed to find pdflatex in path!\n" unless $opt{pdflatex};
+die "\nFailed to find kpsewhich in path!\n" unless $opt{kpsewhich};
+
+print "done\n" if $opt{verbose};
+
+#######################################################
+### Check we have required TeX packages and provide ###
+### useful warnings for optionally needed packages  ###
+#######################################################
+
+print "Checking TeX packages..." if $opt{verbose};
+
+# now have a look around for some TeX packages
+my %texpackages = kpsewhich('pdfpages.sty', 'eso-pic.sty', 'everyshi.sty', 'hyperref.sty', 'geometry.sty');
+
+# we need these three to function
+die "\nCan't find required TeX package pdfpages!\n" unless $texpackages{'pdfpages.sty'};
+die "\nCan't find required TeX package eso-pic!\n" unless $texpackages{'eso-pic.sty'};
+die "\nCan't find required TeX package everyshi!\n" unless $texpackages{'everyshi.sty'};
+
+# print some helpful error messages if prerequisites are missing
+my @prerequisites;
+
+# keepinfo
+if($opt{keepinfo} && !$opt{pdfinfo}) {
+	push @prerequisites, "Cannot keep pdf info without pdfinfo!";
+}
+
+# hyperref
+if(defined $opt{title} || defined $opt{author} || defined $opt{subject} || defined $opt{keywords}) {
+	push @prerequisites, "Cannot set pdf properties without the TeX hyperref package!" if !$texpackages{'hyperref.sty'};
+} elsif(!$opt{keepinfo}) {
+	# if we're not --keepinfo and haven't set any pdf properties disable hyperref
+	$texpackages{'hyperref.sty'} = 0;
+}
+
+# crop
+if($opt{crop} && !$opt{ghostscript}) {
+	push @prerequisites, "Cannot crop without ghostscript!";
+}
+
+# checkfiles
+if($opt{checkfiles} && !$opt{file}) {
+	push @prerequisites, "Cannot checkfiles without file command!";
+}
+
+# paper
+if(!$texpackages{'geometry.sty'} && $opt{paper} !~ /^(a4|a5|b5|letter|executive|legal)paper$/) {
+	# need geometry package
+	push @prerequisites, "We need the TeX geometry package for the paper size $opt{paper}!";
+}
+
+
+if($#prerequisites > -1) {
+	print "\n";
+	push @prerequisites, "Check the command is in your path!";
+	print join "\n", @prerequisites;
+	print "\n";
+	exit;
+}
+
+print "done\n" if $opt{verbose};
+
+##########################################
+### Process margins if we are cropping ###
+##########################################
+
+my @margins;
+if($opt{crop}) {
+	@margins = split(/ +/, $opt{margin});
+	my %unit = ( ''=>1, 'pt'=>1, 'in'=>0.0138, 'mm'=>0.3527, 'cm' =>0.03527, 'P'=>0.08333333 );
+
+	unless($#margins == 0 || $#margins == 1 || $#margins == 3) {
+		die "--margin must have 1, 2 or 4 measurements\n";
+	}
+
+	foreach my $margin (@margins) {
+		if($margin =~ m/^(-?[0-9\.]+)(pt|in|mm|cm|P|)$/) {
+			$margin = int(($1 / $unit{$2}) + 0.5);
+		} else {
+			die "Malformed --margin param\n";
+		}
+	}
+
+	if($#margins == 0) {
+		@margins = ($margins[0], $margins[0], $margins[0], $margins[0]);
+	} elsif($#margins == 1) {
+		@margins = ($margins[0], $margins[1], $margins[0], $margins[1]);
+	}
+}
+
+###############################################################
+### Create a temporary directory for processing TeX files   ###
+###############################################################
+
+my $tmpdir;
+if(defined $opt{tempfiledir}) {
+	$opt{tempfiledir} = safe_abs_path($opt{tempfiledir});
+	$tmpdir = File::Temp->newdir( 'perljam-XXXXX', DIR => $opt{tempfiledir}, CLEANUP => $opt{tidy});
+} else {
+	$tmpdir = File::Temp->newdir( 'perljam-XXXXX', TMPDIR => 1, CLEANUP => $opt{tidy});
+}
+
+if(!$opt{tidy} || $opt{verbose}) {
+	print "Temporary directory for this job is $tmpdir\n";
+}
+
+###########################################################################
+### Process pdf files, determine bounding box for cropping if desired   ###
+###########################################################################
+
+my $counter = 1;
+my %output_filenames = ();
+for my $file (@input_files) {
+	if(!defined $file->{pages}) {
+		$file->{pages} = '-';
+		$file->{selector} = [[1,'inf']];
+	}
+
+	if($file->{source} eq 'stdin') {
+		$file->{texname} = "input.pdf";
+		my $temp_file = "$tmpdir/input.pdf";
+
+		open (REDIR, ">$temp_file") || die "Failed to create temp file: $temp_file\n";
+
+		# avoid crlf to lf translation on windows
+		if($^O eq 'MSWin32') {
+			binmode STDIN;
+			binmode REDIR;
+		}
+
+		print REDIR <STDIN>;
+		close REDIR;
+	} elsif($^O eq 'MSWin32') {
+		# use special windows short names with forward slashes to avoid complicated
+		# filename escaping on windows systems
+		# $^O eq 'MSWin32' on 64 bit systems
+
+		my $f = Win32::GetShortPathName($file->{source});
+		$f =~ s|\\|/|g;
+
+		$file->{texname} = '\detokenize{' . $f . '}';
+		if($opt{batch}) {
+			$file->{tmpdir} = $tmpdir . "/file$counter";
+
+			# create tmpdir
+			mkdir $file->{tmpdir} || die "Failed to create temporary directory: $file->{tmpdir}\n";
+		}
+	} else {
+		# create temporary symbolic link to avoid complicated
+		# filename escaping on unix/linux/mac systems
+		my $link_file;
+		if($opt{batch}) {
+			$link_file = $tmpdir . "/file$counter/input.pdf";
+			$file->{tmpdir} = $tmpdir . "/file$counter";
+			$file->{texname} = 'input.pdf';
+
+			# create tmpdir now before link
+			mkdir $file->{tmpdir} || die "Failed to create temporary directory: $file->{tmpdir}\n";
+		} else {
+			$link_file = $tmpdir . "/input$counter.pdf";
+			$file->{texname} = "input$counter.pdf";
+		}
+
+		symlink ($file->{source}, $link_file) || die "Failed to create link file: $link_file\n";
+	}
+	$counter++;
+
+	if($opt{keepinfo}) {
+		get_pdfinfo($file);
+	}
+
+	if($opt{crop}) {
+		$file->{bb} = do_crop($file);
+	}
+}
+
+####################
+### Generate TeX ###
+####################
+
+my $tex_file_content = "\\batchmode\n";
+
+my @document_options = ($opt{paper});
+push @document_options, 'landscape' if $opt{landscape};
+push @document_options, 'twoside' if $opt{twoside};
+$tex_file_content .= "\\documentclass[" . join(',', @document_options) . "]{article}\n";
+
+if($opt{pagecolor}) {
+	$tex_file_content .= '\\usepackage{color} \\definecolor{bgclr}{RGB}{';
+	$tex_file_content .= $opt{pagecolor};
+	$tex_file_content .=  '} \\pagecolor{bgclr}' . "\n";
+}
+
+if($texpackages{'geometry.sty'}) {
+	$tex_file_content .= "\\usepackage[$opt{paper}]{geometry}\n";
+}
+
+$tex_file_content .= "\\usepackage[utf8]{inputenc}\n";
+
+if($texpackages{'hyperref.sty'}) {
+	$tex_file_content .= "\\usepackage{hyperref}\n";
+
+	foreach my $p (qw|title author subject keywords|) {
+		if(defined $opt{$p}) {
+			$tex_file_content .= '\\hypersetup{pdf' . $p . '={' . $opt{$p} . "}}\n";
+		} elsif($opt{keepinfo} && defined $pdf{$p}) {
+			$tex_file_content .= '\\hypersetup{pdf' . $p . '={' . $pdf{$p} . "}}\n";
+		}
+	}
+}
+
+# package options
+$tex_file_content .= "\\usepackage";
+my @package_options = grep { $package_options{$_} } keys %package_options;
+if($#package_options > -1) {
+	$tex_file_content .= '[' . (join ',', @package_options) . ']';
+}
+$tex_file_content .= "{pdfpages}\n";
+
+# print preamble if we have any
+$tex_file_content .= $opt{preamble} . "\n";
+
+# don't use \includepdfset as not all options can be included that way
+my @global_options = ();
+while(my($k, $v) = each %pdf) {
+	if(defined $v && length $v > 0) {
+		push(@global_options, $k . '={' . $v . '}');
+	}
+}
+
+$tex_file_content .= "\\begin{document}\n";
+
+my $start_cwd = getcwd(); # save current directory
+if($opt{batch}) {
+	print "Batch mode..\n" if $opt{verbose};
+	foreach my $file (@input_files) {
+		chdir $file->{tmpdir};
+
+		open TEMPLATE, '>a.tex' || die "Failed to create tex file: " .  getcwd() . "/a.tex\n";
+
+		print TEMPLATE $tex_file_content;
+		print TEMPLATE includepdf($file, 'pages', 'bb');
+		print TEMPLATE "\\end{document}\n";
+		close TEMPLATE;
+
+		callpdflatex(); # works on current directory
+
+		my $pdf_name = get_pdf_basename($file->{source});
+		my $o = get_unique_filename("$opt{out}/$pdf_name", "$opt{suffix}.pdf");
+
+		move_output($o);
+	}
+} else {
+	chdir $tmpdir;
+
+	open TEMPLATE, '>a.tex' || die "Failed to create tex file: " .  getcwd() . "/a.tex\n";
+
+	print TEMPLATE $tex_file_content;
+	foreach my $file (@input_files) {
+		print TEMPLATE  includepdf($file, 'pages', 'bb');
+	}
+	print TEMPLATE "\\end{document}\n";
+	close TEMPLATE;
+
+	callpdflatex(); # works on current directory
+
+	my $pdf_name;
+	my $o;
+	if(-d $opt{out}) {
+		if($#input_files == 0) {
+			$pdf_name = get_pdf_basename($input_files[0]{source});
+		} else {
+			$pdf_name = 'output';
+		}
+		$o = get_unique_filename("$opt{out}/$pdf_name", "$opt{suffix}.pdf");
+	} else {
+		$o = $opt{out};
+	}
+
+	move_output($o);
+}
+chdir $start_cwd;
+
+#########################
+###    Subroutines    ###
+#########################
+
+# runs kpsewhich commmand, return true/false list of installed Tex packages
+sub kpsewhich {
+	my %texpackages;
+	foreach my $k (@_) {
+		$texpackages{$k} = 0;
+	}
+
+	open3(0, \*CMD, \*CMD,  $opt{kpsewhich}, keys %texpackages);
+	while(my $file = <CMD>) {
+		chomp $file;
+		$file =~ s|^.*/||;
+		if(exists $texpackages{$file}) {
+			$texpackages{$file} = 1;
+		}
+	}
+	close CMD;
+
+	return %texpackages;
+}
+
+# Documentation
+sub print_help {
+	print "I should really write some documentations sometime...\n";
+}
+
+# get a unique filename for output - loops until it finds one
+sub get_unique_filename {
+	my ($prefix, $suffix) = @_;
+	my $o;
+	my $i = 0;
+	my $h = '.';
+
+	do {
+		$o = "$prefix$h$suffix";
+		$i++;
+		$h = ".$i.";
+	} while -f $o;
+	return $o;
+}
+
+sub parse_param_index {
+	# parse param types from array
+	my %param_guide;
+	while(my $k = shift @_) {
+		my $h = {};
+		if($k =~ s/\!$//) {
+			$h->{type} = 'boolean';
+		} elsif($k =~ s/\!([a-z0-9]+)$//) {
+			$h->{type} = 'boolean';
+			$h->{invert} = $1;
+		} elsif($k =~ s/\=v\:(.+)$//) {
+			$h->{type} = 'value';
+			$h->{assoc} = $1;
+		} else {
+			$h->{type} = 'string';
+		}
+
+		my @names = split (/\|/, $k);
+		$h->{name} = $names[0];
+
+		foreach my $pk (@names) {
+			$param_guide{$pk} = $h;
+		}
+	}
+
+	return \%param_guide;
+}
+
+sub process_args_from_cmd_line {
+	my $param_guide = shift;
+
+	# process command line args
+	my %params_from_cmd;
+	my @remainder;
+	my $awaiting_value;
+	while (my $arg = shift @ARGV) {
+		if($arg eq '--') {
+			last;
+		} elsif($arg =~ m/^--(.+)$/ || $arg =~ /^-([a-zA-Z])$/) {
+			$awaiting_value = undef; # reset
+			@remainder = (); # reset
+
+			my $key = lc $1;
+			my $value;
+
+			my $ref = $key;
+			my $boolean_value = $ref =~ s/^no-?// ? 0 : 1;
+
+			if(defined $param_guide->{$ref}) {
+				$key = $param_guide->{$ref}{name};
+
+				if($param_guide->{$ref}{type} eq 'value') {
+					# transform --a4paper to --paper a4
+					$key = $param_guide->{$ref}{assoc};
+					$value = $param_guide->{$ref}{name};
+				} elsif($param_guide->{$ref}{type} eq 'boolean') {
+					$value = $boolean_value;
+
+					# grab next value (if any)
+					if(my $next = shift @ARGV) {
+						if($next =~ /^(false|0)$/) {
+							$value = $value ? 0 : 1;
+						} elsif($next =~ /^(true|1)$/) {
+							# nothing to do here, are true by default
+						} else {
+							unshift @ARGV, $next;
+						}
+					}
+
+					# deal with inversions eg (quiet to verbose)
+					if(defined $param_guide->{$ref}{invert}) {
+						$key = $param_guide->{$ref}{invert};
+						$value = $value ? 0 : 1;
+					}
+				}
+			}
+
+			if(!defined $value) {
+				$awaiting_value = $key;
+			}
+
+			$params_from_cmd{$key} = $value;
+		} elsif (defined $awaiting_value) {
+			$params_from_cmd{$awaiting_value} = $arg;
+			$awaiting_value = undef;
+		} else {
+			push @remainder, $arg;
+		}
+	}
+
+	# unshift unused back onto ARGV
+	unshift @ARGV, @remainder;
+
+	return \%params_from_cmd;
+}
+
+sub process_args_from_file {
+	my $param_guide = shift;
+	my @configfiles = @_;
+
+	# now process configuration file
+	my %params_from_file = ();
+	while(my $configfile = shift @configfiles) {
+		open CONFIG, '<', $configfile;
+		while(my $line = <CONFIG>) {
+			chomp $line;
+			$line =~ s|#.*$||; # remove comments
+			$line =~ s|^[\t ]*(.+)[\t ]*$|$1|; # remove whitespace
+			next if $line =~ m|^[\t ]*$|;
+
+			$line =~ m/^([a-zA-Z1-9]+)(.*$|$)/ || next;
+
+			my $key = lc $1;
+			my $ref = $key;
+
+			my $value = $2;
+			$value =~ s/^ *[=:]//;
+			$value =~ s|^[\t ]*||;
+			$value =~ s/^(['"])(.*)\g1$/$2/g; # strip quotes
+
+			my $boolean_value = ($ref =~ s/^no-?// ? 0 : 1);
+
+			if(defined $param_guide->{$ref}) {
+				$key = $param_guide->{$ref}{name};
+				if($param_guide->{$ref}{type} eq 'value') {
+					$key = $param_guide->{$ref}{assoc};
+					$value = $param_guide->{$ref}{name};
+				} elsif($param_guide->{$ref}{type} eq 'boolean') {
+					if($value =~ /^(false|0)$/) {
+						$value = $boolean_value ? 0 : 1;
+					}
+
+					# deal with inversions eg (quiet to verbose)
+					if(defined $param_guide->{$ref}{invert}) {
+						$key = $param_guide->{$ref}{invert};
+						$value = $value ? 0 : 1;
+					}
+				}
+			}
+
+			$params_from_file{$key} = $value;
+		}
+		close CONFIG;
+	}
+
+	return \%params_from_file;
+}
+
+sub includepdf {
+	my $fileobj = shift;
+	my @keys = @_;
+
+	my @file_options;
+	foreach my $k (@keys) {
+		if(defined $fileobj->{$k}) {
+			if(length $fileobj->{$k} > 0) {
+				push @file_options, $k . '={' . $fileobj->{$k} . '}';
+			} else {
+				push @file_options, $k;
+			}
+		}
+	}
+	return "\\includepdf[" . join(',', @global_options, @file_options) . ']{' . $fileobj->{texname} . "}\n";
+}
+
+
+sub callpdflatex {
+	# this subroutine relies on the current working directory being correctly set
+	print "Calling pdflatex..."  if $opt{verbose};
+	my $cwd = getcwd();
+
+	open3(0, \*CMD, 0, $opt{pdflatex}, 'a.tex');
+	open MSG, '>a.msg';
+	print MSG <CMD>;
+	close MSG;
+
+	if(close CMD && -f 'a.pdf') {
+		print "done\n" if $opt{verbose};
+	} else {
+		die "Pdflatex failed in $cwd\n";
+	}
+}
+
+sub move_output {
+	my $o = shift;
+
+	# checkfiles
+	if($opt{checkfiles}) {
+		my $output;
+		# run file command on output
+		open3(0, \*CMD, 0, $opt{file}, '-b', 'a.pdf');
+		$output = <CMD>;
+		close CMD;
+		chomp $output;
+
+		if($output !~ m/^PDF document/) {
+			die "Output not verified as a PDF document: '" . getcwd() . "/a.pdf'!\n";
+		}
+	}
+
+	if(move('a.pdf', $o)) {
+		print "Created output file: $o\n" if $opt{verbose};
+	} else {
+		die "Cannot copy '" . getcwd() . "/a.pdf' to '$o'!\n";
+	}
+}
+
+sub check_path {
+	my $exec = shift;
+
+	my $path = File::Which::which($exec); # scalar context
+
+	return 0 if !$path;
+
+	return $exec;
+}
+
+sub get_pdfinfo {
+	my $file = shift;
+
+	my %pdfinfo;
+	open3(0, \*PDFINFO, 0, $opt{pdfinfo}, $file->{source});
+	while(my $line = <PDFINFO>) {
+		next unless $line =~ m/^([^:]*): *(.+)/;
+		$pdfinfo{lc $1} = $2;
+	}
+	close PDFINFO;
+
+	if($pdfinfo{'pages'} =~ /^[0-9]+$/) {
+		$file->{pagecount} = $pdfinfo{'pages'};
+	} else {
+		die "Pdfinfo failed!\n";
+	}
+
+	foreach my $x (qw{title author subject keywords}) {
+		if(defined $pdfinfo{$x}) {
+			$file->{$x} = $pdfinfo{$x};
+		}
+	}
+}
+
+sub do_crop {
+	my $file = shift;
+
+	# get first and last pages
+	my ($first, $last) = get_first_and_last_pages($file->{selector});
+
+	# prepare ghostscript command
+	my @gs_cmdpipe = ($opt{ghostscript}, '-sDEVICE=bbox', '-dBATCH', '-dNOPAUSE');
+	if($first > 1) {
+		push @gs_cmdpipe, '-dFirstPage=' . $first;
+	}
+	if($last ne 'last') {
+		push @gs_cmdpipe, '-dLastPage='. $last;
+	}
+	push @gs_cmdpipe, '-c', 'save', 'pop', '-f', $file->{source};
+
+	# run ghostscript
+	open3(0, \*CMD, \*CMD, @gs_cmdpipe) or die "Cannot call ghostscript!\n";
+
+	print "Running ghostscript for crop..." if $opt{verbose};
+	my @bb;
+	$bb[ $first - 1 ] = (); # dummy to align index with page numbers
+	while (my $line = <CMD>) {
+		if($line =~ /^%%HiResBoundingBox: *([0-9\.]+) ([0-9\.]+) ([0-9\.]+) ([0-9\.]+)/) {
+			push @bb, [$1, $2, $3, $4];
+		}
+	}
+	close(CMD);
+
+	# last page
+	if($last eq 'last' && !defined $file->{pagecount}) {
+		$file->{pagecount} = $#bb;
+	}
+
+	my @usedpages = get_full_page_range($file);
+
+	#Calculate output dimensions
+	my ($left, $top, $right, $bottom) = @{ $bb[shift @usedpages ] };
+	foreach my $i (@usedpages) {
+		if ($bb[$i][0] < $left)   { $left   = $bb[$i][0] }
+		if ($bb[$i][1] < $top)    { $top    = $bb[$i][1] }
+		if ($bb[$i][2] > $right)  { $right  = $bb[$i][2] }
+		if ($bb[$i][3] > $bottom) { $bottom = $bb[$i][3] }
+	}
+
+	# adjust for margins
+	$left   -= $margins[0];
+	$top    += $margins[1];
+	$right  += $margins[2];
+	$bottom -= $margins[3];
+
+	# pdfTex can't deal with decimal places
+	$left   = int $left;
+	$top    = int $top;
+	$right  = int $right;
+	$bottom = int $bottom;
+
+	print "done\n" if $opt{verbose};
+
+	print "Output dimentions: ${left}pt ${top}pt ${right}pt ${bottom}pt\n" if $opt{verbose};
+
+	return "${left}pt ${top}pt ${right}pt ${bottom}pt";
+}
+
+sub parse_selector {
+	my $selector = shift;
+	$selector =~ s/(^|,)-/${1}1-/g;
+	$selector =~ s/-(,|$)/-last$1/g;
+
+	my @allpages = ();
+	foreach my $s (split /,/, $selector) {
+		if($s eq '{}') {
+			next;
+		} elsif($s =~ m/^[0-9]+$/ && $s > 0) {
+			push @allpages, [$s];
+		} elsif(($s =~ m/^last-([0-9]+)$/ || $s =~ m/^([0-9]+)-last$/) &&  $1 > 0) {
+			push @allpages, [$1, 'inf'];
+		} elsif($s =~ m/^([0-9]*)-([0-9]*)$/ && $1 > 0 && $2 > 0) {
+			if($2 < $1){
+				push @allpages, [$2, $1];
+			} else {
+				push @allpages, [$1, $2];
+			}
+		} else {
+			die "Bad selector!\n";
+		}
+	}
+
+	return \@allpages;
+}
+
+sub get_pdf_basename {
+	my $f = shift;
+
+	if($^O eq 'MSWin32') {
+		$f = Win32::GetLongPathName($f);
+		$f =~ s|\\|/|g;
+	}
+
+	$f =~ s|^.*/||;
+	$f =~ s/\.pdf$//i;
+
+	return $f;
+}
+
+sub get_first_and_last_pages {
+	my $selector_ref = shift;
+	my @z = sort { $a <=> $b } map { @$_ } @$selector_ref;
+	my $last = ($z[$#z] == 'inf' ? 'last' : $z[$#z]);
+	return ($z[0], $last);
+}
+
+sub get_full_page_range {
+	my $file = shift;
+
+	my $sel = $file->{selector};
+	my %usedpages = ();
+	foreach my $x (@$sel) {
+		if(!defined $x->[1]) {
+			$usedpages{$x->[0]} = ()
+		} elsif($x->[1] == 'inf') {
+			@usedpages{$x->[0]...$file->{pagecount}} = ();
+		} else {
+			@usedpages{$x->[0]...$x->[1]} = ();
+		}
+	}
+
+	return sort { $a <=> $b } keys %usedpages;
+}
+
+sub safe_abs_path {
+	my $p = shift;
+	my $x = $p =~ s|[/\\]$||; # remove trailing slashes
+
+	if($^O eq 'MSWin32') {
+		# on windows Cwd::safe_abs_path fails on non-existent files
+		$p = Win32::GetFullPathName($p);
+		$p =~ s|\\|/|;
+	} else {
+		$p = abs_path($p);
+	}
+
+	if($x) {
+		$p .= '/';
+	}
+
+	return $p;
+}
