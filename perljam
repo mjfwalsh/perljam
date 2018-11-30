@@ -33,7 +33,7 @@ suffix => 'perljam',
 preamble => '',
 out => getcwd(), # output to current working directory by default
 paper => 'a4paper',
-verbose => 1,
+verbose => 0,
 landscape => 0,
 twoside => 0,
 margin => '0',
@@ -95,6 +95,7 @@ if($args->{help}) {
 }
 
 if($args->{version}) {
+	print "\n" if $opt{verbose};
 	print "Version: $version\n";
 	exit;
 }
@@ -141,7 +142,7 @@ while(my $arg = shift @ARGV) {
 	} elsif($arg eq 'stdin' || $arg eq '-') {
 		# nothing
 	} else {
-		die "$arg does not exist\n";
+		die "\n$arg does not exist\n";
 	}
 
 	my $file = {source => $arg};
@@ -153,7 +154,7 @@ while(my $arg = shift @ARGV) {
 
 	push @input_files, $file;
 }
-die "No input files! Quitting\n" if $#input_files < 0;
+die "\nNo input files! Quitting\n" if $#input_files < 0;
 
 if($opt{batch} == 1 && $#input_files == 0) {
 	# Not much point in batch mode with only one input file
@@ -170,15 +171,15 @@ print "Processing files and selectors..." if $opt{verbose};
 
 $opt{out} = safe_abs_path($opt{out});
 if(-d $opt{out}) {
-	die "Cannot write to output directory: $opt{out}\n" if !-w $opt{out};
+	die "\nCannot write to output directory: $opt{out}\n" if !-w $opt{out};
 } elsif(-e $opt{out}) {
-	die "Output file already exists\n";
+	die "\nOutput file already exists\n";
 } elsif($opt{batch} || $opt{out} =~ m|/$|) {
 	mkdir $opt{out} || die "Failed to create output directory: $opt{out}\n";
 } elsif($opt{out} =~ m|^(.*/)([^/]+)$| && -d $1) {
-	die "Cannot write to output location: $1\n" if !-w $1;
+	die "\nCannot write to output location: $1\n" if !-w $1;
 } else {
-	die "Failed to understand --out|-o\n";
+	die "\nFailed to understand --out|-o\n";
 }
 
 print "done\n" if $opt{verbose};
@@ -566,7 +567,6 @@ sub process_args_from_cmd_line {
 			last;
 		} elsif($arg =~ m/^--(.+)$/ || $arg =~ /^-([a-zA-Z])$/) {
 			$awaiting_value = undef; # reset
-			@remainder = (); # reset
 
 			my $key = lc $1;
 			my $value;
@@ -695,7 +695,6 @@ sub includepdf {
 sub callpdflatex {
 	# this subroutine relies on the current working directory being correctly set
 	print "Calling pdflatex..."  if $opt{verbose};
-	my $cwd = getcwd();
 
 	open3(0, \*CMD, 0, $opt{pdflatex}, 'a.tex');
 	open MSG, '>a.msg';
@@ -705,6 +704,7 @@ sub callpdflatex {
 	if(close CMD && -f 'a.pdf') {
 		print "done\n" if $opt{verbose};
 	} else {
+		my $cwd = getcwd();
 		die "Pdflatex failed in $cwd\n";
 	}
 }
@@ -814,21 +814,23 @@ sub do_crop {
 
 	# adjust for margins
 	$left   -= $margins[0];
-	$top    += $margins[1];
+	$top    -= $margins[1];
 	$right  += $margins[2];
-	$bottom -= $margins[3];
+	$bottom += $margins[3];
 
 	# pdfTex can't deal with decimal places
-	$left   = int $left;
-	$top    = int $top;
-	$right  = int $right;
-	$bottom = int $bottom;
+	$left   = int($left + 0.5);
+	$top    = int($top + 0.5);
+	$right  = int($right + 0.5);
+	$bottom = int($bottom + 0.5);
 
-	print "done\n" if $opt{verbose};
+	if($opt{verbose}) {
+		print "done\n";
+		print "Margins: " , join (' ', @margins) , "\n";
+		print "Output dimentions: ${left}bp ${top}bp ${right}bp ${bottom}bp\n";
+	}
 
-	print "Output dimentions: ${left}pt ${top}pt ${right}pt ${bottom}pt\n" if $opt{verbose};
-
-	return "${left}pt ${top}pt ${right}pt ${bottom}pt";
+	return "${left}bp ${top}bp ${right}bp ${bottom}bp";
 }
 
 sub parse_selector {
