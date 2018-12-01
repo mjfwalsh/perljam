@@ -36,7 +36,6 @@ paper => 'a4paper',
 verbose => 0,
 landscape => 0,
 twoside => 0,
-margin => '0',
 );
 
 # default binary names depend on operating system
@@ -263,23 +262,38 @@ if($#prerequisites > -1) {
 print "done\n" if $opt{verbose};
 
 ##########################################
-### Process margins if we are cropping ###
+### Process margins                    ###
 ##########################################
 
 my @margins;
-if($opt{crop}) {
+if($opt{margin}) {
 	@margins = split(/ +/, $opt{margin});
-	my %unit = ( ''=>1, 'pt'=>1, 'in'=>0.0138, 'mm'=>0.3527, 'cm' =>0.03527, 'P'=>0.08333333 );
 
 	unless($#margins == 0 || $#margins == 1 || $#margins == 3) {
 		die "--margin must have 1, 2 or 4 measurements\n";
 	}
 
-	foreach my $margin (@margins) {
-		if($margin =~ m/^(-?[0-9\.]+)(pt|in|mm|cm|P|)$/) {
-			$margin = int(($1 / $unit{$2}) + 0.5);
-		} else {
-			die "Malformed --margin param\n";
+	if($opt{crop}) {
+		# Ghostscript uses post script points (1/72 of an inch) while tex uses US points (1/72.27 of an inch)
+		my %units = (mm => 2.83464566929134, pc => 11.9551681195517,
+			cm => 28.3464566929134, in => 72, pt => 0.99626400996264, bp => 1);
+		$units{''} = $units{'pt'};
+
+		foreach my $margin (@margins) {
+			if($margin =~ m/^(-?[0-9\.]+)(mm|pc|cm|in|pt|bp|)$/) {
+				$margin = int(($1 * $units{$2}) + 0.5);
+			} else {
+				die "Malformed --margin param\n";
+			}
+		}
+	} else {
+		foreach my $margin (@margins) {
+			if($margin =~ m/^(-?[0-9\.]+)(mm|pc|cm|in|pt|bp|)$/) {
+				my $unit = $2 eq '' ? 'pt' : $2;
+				$margin = ($1 * -1) . $unit;
+			} else {
+				die "Malformed --margin param\n";
+			}
 		}
 	}
 
@@ -288,6 +302,12 @@ if($opt{crop}) {
 	} elsif($#margins == 1) {
 		@margins = ($margins[0], $margins[1], $margins[0], $margins[1]);
 	}
+
+	if(!$opt{crop}) {
+		$pdf{trim} = join ' ', @margins;
+	}
+} else {
+	@margins = (0, 0, 0, 0);
 }
 
 ###############################################################
@@ -368,11 +388,34 @@ for my $file (@input_files) {
 	$counter++;
 
 	if($opt{keepinfo}) {
-		get_pdfinfo($file);
+		my %pdfinfo;
+		open3(0, \*PDFINFO, 0, $opt{pdfinfo}, $file->{source});
+		while(my $line = <PDFINFO>) {
+			next unless $line =~ m/^([^:]*): *(.+)/;
+			$pdfinfo{lc $1} = $2;
+		}
+		close PDFINFO;
+
+		if($pdfinfo{'pages'} =~ /^[0-9]+$/) {
+			$file->{pagecount} = $pdfinfo{'pages'};
+		} else {
+			die "Pdfinfo failed!\n";
+		}
+
+		if($pdfinfo{'page size'} =~ /^([0-9\.]+) x ([0-9\.]+) pts/) {
+			$file->{width} = $1;
+			$file->{height} = $2;
+		}
+
+		foreach my $x (qw{title author subject keywords}) {
+			if(defined $pdfinfo{$x}) {
+				$file->{$x} = $pdfinfo{$x};
+			}
+		}
 	}
 
 	if($opt{crop}) {
-		$file->{bb} = do_crop($file);
+		$file->{viewport} = do_crop($file);
 	}
 }
 
@@ -441,7 +484,7 @@ if($opt{batch}) {
 		open TEMPLATE, '>a.tex' || die "Failed to create tex file: " .  getcwd() . "/a.tex\n";
 
 		print TEMPLATE $tex_file_content;
-		print TEMPLATE includepdf($file, 'pages', 'bb');
+		print TEMPLATE includepdf($file, 'pages', 'viewport');
 		print TEMPLATE "\\end{document}\n";
 		close TEMPLATE;
 
@@ -459,7 +502,7 @@ if($opt{batch}) {
 
 	print TEMPLATE $tex_file_content;
 	foreach my $file (@input_files) {
-		print TEMPLATE  includepdf($file, 'pages', 'bb');
+		print TEMPLATE  includepdf($file, 'pages', 'viewport');
 	}
 	print TEMPLATE "\\end{document}\n";
 	close TEMPLATE;
@@ -743,30 +786,6 @@ sub check_path {
 	return $exec;
 }
 
-sub get_pdfinfo {
-	my $file = shift;
-
-	my %pdfinfo;
-	open3(0, \*PDFINFO, 0, $opt{pdfinfo}, $file->{source});
-	while(my $line = <PDFINFO>) {
-		next unless $line =~ m/^([^:]*): *(.+)/;
-		$pdfinfo{lc $1} = $2;
-	}
-	close PDFINFO;
-
-	if($pdfinfo{'pages'} =~ /^[0-9]+$/) {
-		$file->{pagecount} = $pdfinfo{'pages'};
-	} else {
-		die "Pdfinfo failed!\n";
-	}
-
-	foreach my $x (qw{title author subject keywords}) {
-		if(defined $pdfinfo{$x}) {
-			$file->{$x} = $pdfinfo{$x};
-		}
-	}
-}
-
 sub do_crop {
 	my $file = shift;
 
@@ -824,11 +843,7 @@ sub do_crop {
 	$right  = int($right + 0.5);
 	$bottom = int($bottom + 0.5);
 
-	if($opt{verbose}) {
-		print "done\n";
-		print "Margins: " , join (' ', @margins) , "\n";
-		print "Output dimentions: ${left}bp ${top}bp ${right}bp ${bottom}bp\n";
-	}
+	print "done\nOutput dimentions: ${left}bp ${top}bp ${right}bp ${bottom}bp\n" if $opt{verbose};
 
 	return "${left}bp ${top}bp ${right}bp ${bottom}bp";
 }
