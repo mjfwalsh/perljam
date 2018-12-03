@@ -20,7 +20,6 @@ BEGIN { require Win32 if $^O eq 'MSWin32'; }
 my $version = '0.0';
 my %pdf = ();
 my @input_files;
-my %package_options;
 
 # default values
 my %opt = (
@@ -155,7 +154,11 @@ while(my $arg = shift @ARGV) {
 }
 die "\nNo input files! Quitting\n" if $#input_files < 0;
 
-if($opt{batch} == 1 && $#input_files == 0) {
+if(!$opt{batch} && $#input_files > 0 && $opt{keepinfo}) {
+	die "\nWe can't keep info for more than one pdf file when not in batch mode\n";
+}
+
+if($opt{batch} && $#input_files == 0) {
 	# Not much point in batch mode with only one input file
 	$opt{batch} = 0;
 }
@@ -261,9 +264,9 @@ if($#prerequisites > -1) {
 
 print "done\n" if $opt{verbose};
 
-##########################################
-### Process margins                    ###
-##########################################
+#######################
+### Process margins ###
+#######################
 
 my @margins;
 if($opt{margin}) {
@@ -448,22 +451,15 @@ if($texpackages{'hyperref.sty'}) {
 	foreach my $p (qw|title author subject keywords|) {
 		if(defined $opt{$p}) {
 			$tex_file_content .= '\\hypersetup{pdf' . $p . '={' . $opt{$p} . "}}\n";
-		} elsif($opt{keepinfo} && defined $pdf{$p}) {
-			$tex_file_content .= '\\hypersetup{pdf' . $p . '={' . $pdf{$p} . "}}\n";
 		}
 	}
 }
 
 # package options
-$tex_file_content .= "\\usepackage";
-my @package_options = grep { $package_options{$_} } keys %package_options;
-if($#package_options > -1) {
-	$tex_file_content .= '[' . (join ',', @package_options) . ']';
-}
-$tex_file_content .= "{pdfpages}\n";
+my $tex_file_content2 = "\\usepackage{pdfpages}\n";
 
 # print preamble if we have any
-$tex_file_content .= $opt{preamble} . "\n";
+$tex_file_content2 .= $opt{preamble} . "\n";
 
 # don't use \includepdfset as not all options can be included that way
 my @global_options = ();
@@ -473,7 +469,7 @@ while(my($k, $v) = each %pdf) {
 	}
 }
 
-$tex_file_content .= "\\begin{document}\n";
+$tex_file_content2 .= "\\begin{document}\n";
 
 my $start_cwd = getcwd(); # save current directory
 if($opt{batch}) {
@@ -482,8 +478,13 @@ if($opt{batch}) {
 		chdir $file->{tmpdir};
 
 		open TEMPLATE, '>a.tex' || die "Failed to create tex file: " .  getcwd() . "/a.tex\n";
-
 		print TEMPLATE $tex_file_content;
+
+		if($texpackages{'hyperref.sty'}) {
+			print TEMPLATE compile_pdf_info(\%opt, $file);
+		}
+
+		print TEMPLATE $tex_file_content2;
 		print TEMPLATE includepdf($file, 'pages', 'viewport');
 		print TEMPLATE "\\end{document}\n";
 		close TEMPLATE;
@@ -499,8 +500,13 @@ if($opt{batch}) {
 	chdir $tmpdir;
 
 	open TEMPLATE, '>a.tex' || die "Failed to create tex file: " .  getcwd() . "/a.tex\n";
-
 	print TEMPLATE $tex_file_content;
+
+	if($texpackages{'hyperref.sty'}) {
+		print TEMPLATE compile_pdf_info(\%opt, $input_files[0]);
+	}
+
+	print TEMPLATE $tex_file_content2;
 	foreach my $file (@input_files) {
 		print TEMPLATE  includepdf($file, 'pages', 'viewport');
 	}
@@ -932,3 +938,30 @@ sub safe_abs_path {
 
 	return $p;
 }
+
+
+sub compile_pdf_info {
+	my $opt = shift;
+	my $file = shift;
+
+	my @pdfinfo = ();
+	if($texpackages{'hyperref.sty'}) {
+		foreach my $p (qw|title author subject keywords|) {
+			if(defined $opt->{$p}) {
+				push @pdfinfo, 'pdf' . $p . '={' . $opt->{$p} . '}';
+			} elsif(defined $file->{$p}) {
+				push @pdfinfo, 'pdf' . $p . '={' . $file->{$p} . '}';
+			}
+		}
+	}
+
+	my $ret = '';
+	if($#pdfinfo > -1) {
+		$ret .= "\\usepackage{hyperref}\n";
+		$ret .= '\\hypersetup{'
+		$ret .= join ',', @pdfinfo;
+		$ret .= "}\n";
+	}
+	return $ret;
+}
+
