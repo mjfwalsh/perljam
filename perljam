@@ -82,7 +82,7 @@ b6paper=v:paper},
 
 # misc
 qw{batch! checkfiles! keepinfo! tidy! vanilla! crop!
-configpath preamble suffix pagecolor configfile margin},
+configpath preamble. suffix pagecolor configfile margin},
 );
 
 my $args = process_args_from_cmd_line($param_guide);
@@ -147,7 +147,6 @@ while(my $arg = shift @ARGV) {
 
 	if($#ARGV > -1 && $ARGV[0] =~ m/^[,0-9\{\}\-last]+$/ && !-e $ARGV[0]) {
 		$file->{pages} = shift @ARGV;
-		$file->{selector} = parse_selector($file->{pages});
 	}
 
 	push @input_files, $file;
@@ -338,7 +337,6 @@ my %output_filenames = ();
 for my $file (@input_files) {
 	if(!defined $file->{pages}) {
 		$file->{pages} = '-';
-		$file->{selector} = [[1,'inf']];
 	}
 
 	if($file->{source} eq 'stdin') {
@@ -589,6 +587,8 @@ sub parse_param_index {
 		} elsif($k =~ s/\=v\:(.+)$//) {
 			$h->{type} = 'value';
 			$h->{assoc} = $1;
+		} elsif($k =~ s/\.$//) {
+			$h->{type} = 'concat';
 		} else {
 			$h->{type} = 'string';
 		}
@@ -621,7 +621,7 @@ sub process_args_from_cmd_line {
 			my $value;
 
 			my $ref = $key;
-			my $boolean_value = $ref =~ s/^no-?// ? 0 : 1;
+			my $boolean_value = $ref =~ s/^no-// ? 0 : 1;
 
 			if(defined $param_guide->{$ref}) {
 				$key = $param_guide->{$ref}{name};
@@ -658,7 +658,11 @@ sub process_args_from_cmd_line {
 
 			$params_from_cmd{$key} = $value;
 		} elsif (defined $awaiting_value) {
-			$params_from_cmd{$awaiting_value} = $arg;
+			if(defined $param_guide->{$awaiting_value}{type} && $param_guide->{$awaiting_value}{type} eq 'concat' && defined $params_from_cmd{$awaiting_value}) {
+				$params_from_cmd{$awaiting_value} .= "\n" . $arg;
+			} else {
+				$params_from_cmd{$awaiting_value} = $arg;
+			}
 			$awaiting_value = undef;
 		} else {
 			push @remainder, $arg;
@@ -682,10 +686,10 @@ sub process_args_from_file {
 		while(my $line = <CONFIG>) {
 			chomp $line;
 			$line =~ s|#.*$||; # remove comments
-			$line =~ s|^[\t ]*(.+)[\t ]*$|$1|; # remove whitespace
+			$line =~ s|^[\t ]*(.+)[\t ]*$|$1|; # trim whitespace
 			next if $line =~ m|^[\t ]*$|;
 
-			$line =~ m/^([a-zA-Z1-9]+)(.*$|$)/ || next;
+			$line =~ m/^([a-zA-Z0-9\-]+)(.*$|$)/ || next;
 
 			my $key = lc $1;
 			my $ref = $key;
@@ -695,7 +699,7 @@ sub process_args_from_file {
 			$value =~ s|^[\t ]*||;
 			$value =~ s/^(['"])(.*)\g1$/$2/g; # strip quotes
 
-			my $boolean_value = ($ref =~ s/^no-?// ? 0 : 1);
+			my $boolean_value = ($ref =~ s/^no-// ? 0 : 1);
 
 			if(defined $param_guide->{$ref}) {
 				$key = $param_guide->{$ref}{name};
@@ -712,6 +716,9 @@ sub process_args_from_file {
 						$key = $param_guide->{$ref}{invert};
 						$value = $value ? 0 : 1;
 					}
+				} elsif($param_guide->{$ref}{type} eq 'concat' && defined $params_from_file{$key}) {
+					$params_from_file{$key} .= "\n" . $value;
+					next;
 				}
 			}
 
@@ -795,15 +802,32 @@ sub check_path {
 sub do_crop {
 	my $file = shift;
 
+	# parse selector
+	my $selector = $file->{pages};
+	$selector =~ s/last/inf/;
+	$selector =~ s/(^|,)-/${1}1-/g;
+	$selector =~ s/-(,|$)/-inf$1/g;
+	$selector =~ s/(^|,)\{\}/$1/g;
+
 	# get first and last pages
-	my ($first, $last) = get_first_and_last_pages($file->{selector});
+	my ($first, $last) = ('inf', 0);
+	my @parts = split /[-,]/, $selector;
+
+	foreach my $p (@parts) {
+		if($p =~ /^([0-9]+|inf)$/ && $p > 0) {
+			if($p < $first) { $first = $p; }
+			if($p > $last) { $last = $p; }
+		} else {
+			die "\nBad selector: $file->{pages}\n";
+		}
+	}
 
 	# prepare ghostscript command
 	my @gs_cmdpipe = ($opt{ghostscript}, '-sDEVICE=bbox', '-dBATCH', '-dNOPAUSE');
 	if($first > 1) {
 		push @gs_cmdpipe, '-dFirstPage=' . $first;
 	}
-	if($last ne 'last') {
+	if($last ne 'inf') {
 		push @gs_cmdpipe, '-dLastPage='. $last;
 	}
 	push @gs_cmdpipe, '-c', 'save', 'pop', '-f', $file->{source};
@@ -822,11 +846,30 @@ sub do_crop {
 	close(CMD);
 
 	# last page
-	if($last eq 'last' && !defined $file->{pagecount}) {
+	if($last eq 'inf' && !defined $file->{pagecount}) {
 		$file->{pagecount} = $#bb;
 	}
 
-	my @usedpages = get_full_page_range($file);
+	# further selector parsing
+	$selector =~ s/inf/$file->{pagecount}/;
+
+	my %usedpages = ();
+	foreach my $s (split /,/, $selector) {
+		if($s =~ m/^[0-9]+$/) {
+			$usedpages{$s} = 1;
+		} elsif($s =~ m/^([0-9]+)-([0-9]+)$/) {
+			if($1 < $2) {
+				@usedpages{$1...$2} = ();
+			} elsif($1 == $2) {
+				$usedpages{$1} = 1;
+			} else {
+				@usedpages{$2...$1} = ();
+			}
+		} else {
+			die "\nBad selector: $file->{pages}\n";
+		}
+	}
+	my @usedpages = sort { $a <=> $b } keys %usedpages;
 
 	#Calculate output dimensions
 	my ($left, $top, $right, $bottom) = @{ $bb[shift @usedpages ] };
@@ -854,33 +897,6 @@ sub do_crop {
 	return "${left}bp ${top}bp ${right}bp ${bottom}bp";
 }
 
-sub parse_selector {
-	my $selector = shift;
-	$selector =~ s/(^|,)-/${1}1-/g;
-	$selector =~ s/-(,|$)/-last$1/g;
-
-	my @allpages = ();
-	foreach my $s (split /,/, $selector) {
-		if($s eq '{}') {
-			next;
-		} elsif($s =~ m/^[0-9]+$/ && $s > 0) {
-			push @allpages, [$s];
-		} elsif(($s =~ m/^last-([0-9]+)$/ || $s =~ m/^([0-9]+)-last$/) &&  $1 > 0) {
-			push @allpages, [$1, 'inf'];
-		} elsif($s =~ m/^([0-9]*)-([0-9]*)$/ && $1 > 0 && $2 > 0) {
-			if($2 < $1){
-				push @allpages, [$2, $1];
-			} else {
-				push @allpages, [$1, $2];
-			}
-		} else {
-			die "Bad selector!\n";
-		}
-	}
-
-	return \@allpages;
-}
-
 sub get_pdf_basename {
 	my $f = shift;
 
@@ -894,32 +910,6 @@ sub get_pdf_basename {
 
 	return $f;
 }
-
-sub get_first_and_last_pages {
-	my $selector_ref = shift;
-	my @z = sort { $a <=> $b } map { @$_ } @$selector_ref;
-	my $last = ($z[$#z] == 'inf' ? 'last' : $z[$#z]);
-	return ($z[0], $last);
-}
-
-sub get_full_page_range {
-	my $file = shift;
-
-	my $sel = $file->{selector};
-	my %usedpages = ();
-	foreach my $x (@$sel) {
-		if(!defined $x->[1]) {
-			$usedpages{$x->[0]} = ()
-		} elsif($x->[1] == 'inf') {
-			@usedpages{$x->[0]...$file->{pagecount}} = ();
-		} else {
-			@usedpages{$x->[0]...$x->[1]} = ();
-		}
-	}
-
-	return sort { $a <=> $b } keys %usedpages;
-}
-
 sub safe_abs_path {
 	my $p = shift;
 	my $x = $p =~ s|[/\\]$||; # remove trailing slashes
@@ -958,7 +948,7 @@ sub compile_pdf_info {
 	my $ret = '';
 	if($#pdfinfo > -1) {
 		$ret .= "\\usepackage{hyperref}\n";
-		$ret .= '\\hypersetup{'
+		$ret .= '\\hypersetup{';
 		$ret .= join ',', @pdfinfo;
 		$ret .= "}\n";
 	}
