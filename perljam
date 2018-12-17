@@ -658,7 +658,7 @@ sub process_args_from_cmd_line {
 
 			$params_from_cmd{$key} = $value;
 		} elsif (defined $awaiting_value) {
-			if(defined $param_guide->{$awaiting_value}{type} && $param_guide->{$awaiting_value}{type} eq 'concat' && defined $params_from_cmd{$awaiting_value}) {
+			if(defined $param_guide->{$awaiting_value} && $param_guide->{$awaiting_value}{type} eq 'concat' && defined $params_from_cmd{$awaiting_value}) {
 				$params_from_cmd{$awaiting_value} .= "\n" . $arg;
 			} else {
 				$params_from_cmd{$awaiting_value} = $arg;
@@ -801,6 +801,9 @@ sub check_path {
 
 sub do_crop {
 	my $file = shift;
+
+	# ghostscript uses LF in windows
+	local $/ = "\n";
 
 	# parse selector
 	my $selector = $file->{pages};
