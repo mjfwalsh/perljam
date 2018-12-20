@@ -1,17 +1,20 @@
 #!/usr/bin/perl -w
 
+use v5.10;
+
 # core modules
 use strict;
 use File::Copy;
 use Cwd qw{getcwd abs_path};
 use IPC::Open3;
 use File::Temp ();
+use File::Glob ':bsd_glob';
 
 # other modules
 use File::Which ();
 
 # In Windows the open3 command does not do CRLF to LF transition like open does
-$/ = "\r\n" if $^O eq 'MSWin32';
+$/ = "\x0D\x0A" if $^O eq 'MSWin32';
 
 # Load Win32 on windows systems
 BEGIN { require Win32 if $^O eq 'MSWin32'; }
@@ -38,18 +41,20 @@ twoside => 0,
 );
 
 # default binary names depend on operating system
+my %exe_name = ();
 if($^O =~ /mswin32/i) {
-	$opt{ghostscript} = 'gswin32c.exe';
-	$opt{pdflatex} = 'pdflatex.exe';
-	$opt{pdfinfo} = 'pdfinfo.exe';
-	$opt{kpsewhich} = 'kpsewhich.exe';
-	$opt{file} = 'file.exe';
+	$exe_name{ghostscript} = 'gswin32c.exe';
+	$exe_name{ghostscript2} = 'mgs.exe'; # MiKTeX gs on Windows
+	$exe_name{pdflatex} = 'pdflatex.exe';
+	$exe_name{pdfinfo} = 'pdfinfo.exe';
+	$exe_name{kpsewhich} = 'kpsewhich.exe';
+	$exe_name{file} = 'file.exe';
 } else {
-	$opt{ghostscript} = 'gs';
-	$opt{pdflatex} = 'pdflatex';
-	$opt{pdfinfo} = 'pdfinfo';
-	$opt{kpsewhich} = 'kpsewhich';
-	$opt{file} = 'file';
+	$exe_name{ghostscript} = 'gs';
+	$exe_name{pdflatex} = 'pdflatex';
+	$exe_name{pdfinfo} = 'pdfinfo';
+	$exe_name{kpsewhich} = 'kpsewhich';
+	$exe_name{file} = 'file';
 }
 
 ############################################################
@@ -133,6 +138,19 @@ print "done\n" if $opt{verbose};
 
 print "Processing input files..." if $opt{verbose};
 
+# On windows we need to expand filenames ourselves
+if($^O eq 'MSWin32') {
+	my @new_argv = ();
+	foreach my $arg (@ARGV) {
+		if($arg =~ m/\*/ && !-f $arg) {
+			push @new_argv, glob $arg;
+		} else {
+			push @new_argv, $arg;
+		}
+	}
+	@ARGV = @new_argv;
+}
+
 while(my $arg = shift @ARGV) {
 	if(-f $arg || -l $arg) {
 		# get absolute path
@@ -192,11 +210,35 @@ print "done\n" if $opt{verbose};
 
 print "Checking executables..." if $opt{verbose};
 
-foreach my $exec (qw{ghostscript pdflatex pdfinfo kpsewhich file}) {
-	if(-f $opt{$exec}) {
-		$opt{$exec} = safe_abs_path($opt{$exec});
+if(defined $opt{ghostscript}) {
+	if(-f $opt{ghostscript}) {
+		$opt{ghostscript} = safe_abs_path($opt{ghostscript});
 	} else {
-		$opt{$exec} = check_path($opt{$exec});
+		$opt{ghostscript} = check_path($opt{ghostscript});
+	}
+} elsif(-f $exe_name{ghostscript}) {
+	$opt{ghostscript} = safe_abs_path($exe_name{ghostscript});
+} else {
+	my $gs = check_path($exe_name{ghostscript});
+
+	if($^O eq 'MSWin32' && !$gs) {
+		$gs = check_path($exe_name{ghostscript2});
+	}
+
+	$opt{ghostscript} = $gs;
+}
+
+foreach my $exec (qw{pdflatex pdfinfo kpsewhich file}) {
+	if(defined $opt{$exec}) {
+		if(-f $opt{$exec}) {
+			$opt{$exec} = safe_abs_path($opt{$exec});
+		} else {
+			$opt{$exec} = check_path($opt{$exec});
+		}
+	} elsif(-f $exe_name{$exec}) {
+		$opt{$exec} = safe_abs_path($exe_name{$exec});
+	} else {
+		$opt{$exec} = check_path($exe_name{$exec});
 	}
 }
 
@@ -213,7 +255,7 @@ print "done\n" if $opt{verbose};
 print "Checking TeX packages..." if $opt{verbose};
 
 # now have a look around for some TeX packages
-my %texpackages = kpsewhich('pdfpages.sty', 'eso-pic.sty', 'everyshi.sty', 'hyperref.sty', 'geometry.sty');
+my %texpackages = kpsewhich('pdfpages.sty', 'eso-pic.sty', 'everyshi.sty', 'hyperref.sty', 'geometry.sty', 'url.sty');
 
 # we need these three to function
 die "\nCan't find required TeX package pdfpages!\n" unless $texpackages{'pdfpages.sty'};
@@ -229,8 +271,14 @@ if($opt{keepinfo} && !$opt{pdfinfo}) {
 }
 
 # hyperref
-if(defined $opt{title} || defined $opt{author} || defined $opt{subject} || defined $opt{keywords}) {
-	push @prerequisites, "Cannot set pdf properties without the TeX hyperref package!" if !$texpackages{'hyperref.sty'};
+if($opt{keepinfo} || defined $opt{title} || defined $opt{author} || defined $opt{subject} || defined $opt{keywords}) {
+	if(!$texpackages{'hyperref.sty'}) {
+		push @prerequisites, "Cannot set pdf properties or keepinfo without the TeX hyperref package!";
+	}
+	if(!$texpackages{'url.sty'}) {
+		# Not sure why this is????
+		push @prerequisites, "Cannot set pdf properties or keepinfo without the TeX url package!";
+	}
 } elsif(!$opt{keepinfo}) {
 	# if we're not --keepinfo and haven't set any pdf properties disable hyperref
 	$texpackages{'hyperref.sty'} = 0;
@@ -255,7 +303,7 @@ if(!$texpackages{'geometry.sty'} && $opt{paper} !~ /^(a4|a5|b5|letter|executive|
 
 if($#prerequisites > -1) {
 	print "\n";
-	push @prerequisites, "Check the command is in your path!";
+	push @prerequisites, "This could be a PATH issue.";
 	print join "\n", @prerequisites;
 	print "\n";
 	exit;
@@ -324,6 +372,10 @@ if(defined $opt{tempfiledir}) {
 	$tmpdir = File::Temp->newdir( 'perljam-XXXXX', TMPDIR => 1, CLEANUP => $opt{tidy});
 }
 
+if($^O eq 'MSWin32') {
+	$tmpdir =~ s|\\|/|g;
+}
+
 if(!$opt{tidy} || $opt{verbose}) {
 	print "Temporary directory for this job is $tmpdir\n";
 }
@@ -343,7 +395,7 @@ for my $file (@input_files) {
 		$file->{texname} = "input.pdf";
 		my $temp_file = "$tmpdir/input.pdf";
 
-		open (REDIR, ">$temp_file") || die "Failed to create temp file: $temp_file\n";
+		open(REDIR, ">$temp_file") || die "Failed to create temp file: $temp_file\n";
 
 		# avoid crlf to lf translation on windows
 		if($^O eq 'MSWin32') {
@@ -392,15 +444,32 @@ for my $file (@input_files) {
 		my %pdfinfo;
 		open3(0, \*PDFINFO, 0, $opt{pdfinfo}, $file->{source});
 		while(my $line = <PDFINFO>) {
-			next unless $line =~ m/^([^:]*): *(.+)/;
-			$pdfinfo{lc $1} = $2;
+			next unless $line =~ m/^([^:]*): *(.+)$/;
+			my ($k, $v) = ($1, $2);
+			$k = lc $k;
+			$v =~ s/[\x0D\x0A]//g;
+			$v =~ s/^[\t ]*(.*?)[\t ]*$/$1/g;
+			$pdfinfo{$k} = $v;
 		}
 		close PDFINFO;
 
+		# Have the required fields been produced
+		foreach my $k ('title', 'author', 'subject', 'keywords', 'pages', 'page size') {
+			if(!defined $pdfinfo{$k}) {
+				die "Pdfinfo failed to extract $k field! Might be an old version.\n";
+			}
+		}
+
+		# Get page count
 		if($pdfinfo{'pages'} =~ /^[0-9]+$/) {
 			$file->{pagecount} = $pdfinfo{'pages'};
 		} else {
 			die "Pdfinfo failed!\n";
+		}
+
+		# Sometime keepinfo runs but fails to extract any actual info
+		if($pdfinfo{title} . $pdfinfo{author} . $pdfinfo{subject} . $pdfinfo{keywords} eq '') {
+			die "Pdfinfo failed to extract pdf info! Might be an old version.\n";
 		}
 
 		if($pdfinfo{'page size'} =~ /^([0-9\.]+) x ([0-9\.]+) pts/) {
@@ -409,9 +478,7 @@ for my $file (@input_files) {
 		}
 
 		foreach my $x (qw{title author subject keywords}) {
-			if(defined $pdfinfo{$x}) {
-				$file->{$x} = $pdfinfo{$x};
-			}
+			$file->{$x} = $pdfinfo{$x};
 		}
 	}
 
@@ -454,7 +521,12 @@ if($texpackages{'hyperref.sty'}) {
 }
 
 # package options
-my $tex_file_content2 = "\\usepackage{pdfpages}\n";
+my $tex_file_content2 = "\\usepackage";
+my @package_options = grep { $opt{$_} } 'final', 'draft', 'enable-survey';
+if($#package_options > -1) {
+	$tex_file_content2 .= '[' . (join ',', @package_options) . ']';
+}
+$tex_file_content2 .= "{pdfpages}\n";
 
 # print preamble if we have any
 $tex_file_content2 .= $opt{preamble} . "\n";
@@ -920,7 +992,7 @@ sub safe_abs_path {
 	if($^O eq 'MSWin32') {
 		# on windows Cwd::safe_abs_path fails on non-existent files
 		$p = Win32::GetFullPathName($p);
-		$p =~ s|\\|/|;
+		$p =~ s|\\|/|g;
 	} else {
 		$p = abs_path($p);
 	}
