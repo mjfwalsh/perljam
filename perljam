@@ -1,6 +1,6 @@
 #!/usr/bin/perl -w
 
-use v5.10;
+use 5.012; # ie v5.12 (for the most part its tested under v5.18)
 
 # core modules
 use strict;
@@ -825,12 +825,18 @@ sub includepdf {
 
 sub callpdflatex {
 	# this subroutine relies on the current working directory being correctly set
-	print "Calling pdflatex..."  if $opt{verbose};
+	print "Calling pdflatex...\n"  if $opt{verbose};
 
 	open3(0, \*CMD, 0, $opt{pdflatex}, 'a.tex');
-	open MSG, '>a.msg';
-	print MSG <CMD>;
-	close MSG;
+
+	if($opt{verbose}) {
+		print <CMD>;
+	} else {
+		open MSG, '>a.msg';
+		binmode MSG;
+		print MSG <CMD>;
+		close MSG;
+	}
 
 	if(close CMD && -f 'a.pdf') {
 		print "done\n" if $opt{verbose};
@@ -911,14 +917,20 @@ sub do_crop {
 	open3(0, \*CMD, \*CMD, @gs_cmdpipe) or die "Cannot call ghostscript!\n";
 
 	print "Running ghostscript for crop..." if $opt{verbose};
+
 	my @bb;
-	$bb[ $first - 1 ] = (); # dummy to align index with page numbers
+	$bb[ $first - 1 ] = (); # dummy to align index with logical page numbers
 	while (my $line = <CMD>) {
-		if($line =~ /^%%HiResBoundingBox: *([0-9\.]+) ([0-9\.]+) ([0-9\.]+) ([0-9\.]+)/) {
+		if($line =~ /^%%HiResBoundingBox: *(-?[0-9\.]+) (-?[0-9\.]+) (-?[0-9\.]+) (-?[0-9\.]+)/) { # ignore CRs
+			print $line if $opt{verbose};
 			push @bb, [$1, $2, $3, $4];
 		}
 	}
 	close(CMD);
+
+	if($#bb == $first - 1) {
+		die "\nCrop failed to process any pages\n";
+	}
 
 	# last page
 	if($last eq 'inf' && !defined $file->{pagecount}) {
@@ -946,6 +958,10 @@ sub do_crop {
 	}
 	my @usedpages = sort { $a <=> $b } keys %usedpages;
 
+	if($usedpages[$#usedpages] > $#bb) {
+		die "\nSelector exceeds page count\n";
+	}
+
 	#Calculate output dimensions
 	my ($left, $top, $right, $bottom) = @{ $bb[shift @usedpages ] };
 	foreach my $i (@usedpages) {
@@ -972,6 +988,8 @@ sub do_crop {
 	return "${left}bp ${top}bp ${right}bp ${bottom}bp";
 }
 
+# Strip off the file path and name extension
+# Look for the long name on Win32
 sub get_pdf_basename {
 	my $f = shift;
 
