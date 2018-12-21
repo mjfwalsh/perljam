@@ -13,8 +13,16 @@ use File::Glob ':bsd_glob';
 # other modules
 use File::Which ();
 
-# In Windows the open3 command does not do CRLF to LF transition like open does
-$/ = "\x0D\x0A" if $^O eq 'MSWin32';
+# Perl on Win32 doesn't support open LIST, so I use open3 to avoid make allow filename
+# safe operations. This can create problems for line endings.
+
+# While Windows traditionally uses CRLF endings, some of the applications this script
+# uses output unix LF endings instead.
+
+# To make the script version and future proof I set $/ to LF and deal with CRs on the
+# go.
+
+$/ = "\x0A";
 
 # Load Win32 on windows systems
 BEGIN { require Win32 if $^O eq 'MSWin32'; }
@@ -396,13 +404,8 @@ for my $file (@input_files) {
 		my $temp_file = "$tmpdir/input.pdf";
 
 		open(REDIR, ">$temp_file") || die "Failed to create temp file: $temp_file\n";
-
-		# avoid crlf to lf translation on windows
-		if($^O eq 'MSWin32') {
-			binmode STDIN;
-			binmode REDIR;
-		}
-
+		binmode STDIN;
+		binmode REDIR;
 		print REDIR <STDIN>;
 		close REDIR;
 	} elsif($^O eq 'MSWin32') {
@@ -444,11 +447,11 @@ for my $file (@input_files) {
 		my %pdfinfo;
 		open3(0, \*PDFINFO, 0, $opt{pdfinfo}, $file->{source});
 		while(my $line = <PDFINFO>) {
+			$line =~ s/[\x0D\x0A]+$//; # chomp
 			next unless $line =~ m/^([^:]*): *(.+)$/;
 			my ($k, $v) = ($1, $2);
 			$k = lc $k;
-			$v =~ s/[\x0D\x0A]//g;
-			$v =~ s/^[\t ]*(.*?)[\t ]*$/$1/g;
+			$v =~ s/^\s*(.*?)\s*$/$1/g;
 			$pdfinfo{$k} = $v;
 		}
 		close PDFINFO;
@@ -615,7 +618,7 @@ sub kpsewhich {
 
 	open3(0, \*CMD, \*CMD,  $opt{kpsewhich}, keys %texpackages);
 	while(my $file = <CMD>) {
-		chomp $file;
+		$file =~ s/[\x0D\x0A]+$//; # chomp
 		$file =~ s|^.*/||;
 		if(exists $texpackages{$file}) {
 			$texpackages{$file} = 1;
@@ -756,10 +759,10 @@ sub process_args_from_file {
 	while(my $configfile = shift @configfiles) {
 		open CONFIG, '<', $configfile;
 		while(my $line = <CONFIG>) {
-			chomp $line;
+			$line =~ s/[\x0D\x0A]+$//; # chomp
 			$line =~ s|#.*$||; # remove comments
-			$line =~ s|^[\t ]*(.+)[\t ]*$|$1|; # trim whitespace
-			next if $line =~ m|^[\t ]*$|;
+			$line =~ s|^\s*(.+?)\s*$|$1|; # trim whitespace
+			next if $line eq '';
 
 			$line =~ m/^([a-zA-Z0-9\-]+)(.*$|$)/ || next;
 
@@ -768,7 +771,7 @@ sub process_args_from_file {
 
 			my $value = $2;
 			$value =~ s/^ *[=:]//;
-			$value =~ s|^[\t ]*||;
+			$value =~ s|^\s*||;
 			$value =~ s/^(['"])(.*)\g1$/$2/g; # strip quotes
 
 			my $boolean_value = ($ref =~ s/^no-// ? 0 : 1);
@@ -847,7 +850,7 @@ sub move_output {
 		open3(0, \*CMD, 0, $opt{file}, '-b', 'a.pdf');
 		$output = <CMD>;
 		close CMD;
-		chomp $output;
+		$output =~ s/[\x0D\x0A]+$//; # chomp
 
 		if($output !~ m/^PDF document/) {
 			die "Output not verified as a PDF document: '" . getcwd() . "/a.pdf'!\n";
@@ -873,9 +876,6 @@ sub check_path {
 
 sub do_crop {
 	my $file = shift;
-
-	# ghostscript uses LF in windows
-	local $/ = "\n";
 
 	# parse selector
 	my $selector = $file->{pages};
@@ -987,7 +987,7 @@ sub get_pdf_basename {
 }
 sub safe_abs_path {
 	my $p = shift;
-	my $x = $p =~ s|[/\\]$||; # remove trailing slashes
+	my $x = $p =~ s|[/\\]$||s; # remove trailing slashes
 
 	if($^O eq 'MSWin32') {
 		# on windows Cwd::safe_abs_path fails on non-existent files
