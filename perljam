@@ -441,10 +441,10 @@ for my $file (@input_files) {
 		}
 		close PDFINFO;
 
-		# Have the required fields been produced
+		# Avoid errors due to undefined fields
 		foreach my $k ('title', 'author', 'subject', 'keywords', 'pages', 'page size') {
 			if(!defined $pdfinfo{$k}) {
-				die "Pdfinfo failed to extract $k field! Might be an old version.\n";
+				$pdfinfo{$k} = '';
 			}
 		}
 
@@ -456,8 +456,8 @@ for my $file (@input_files) {
 		}
 
 		# Sometime keepinfo runs but fails to extract any actual info
-		if($pdfinfo{title} . $pdfinfo{author} . $pdfinfo{subject} . $pdfinfo{keywords} eq '') {
-			die "Pdfinfo failed to extract pdf info! Might be an old version.\n";
+		if($pdfinfo{title} eq '' && $pdfinfo{author} eq '' && $pdfinfo{subject} eq '' && $pdfinfo{keywords} eq '') {
+			print "Pdfinfo failed to extract pdf info from $file->{source}! Might be an old version.\n";
 		}
 
 		if($pdfinfo{'page size'} =~ /^([0-9\.]+) x ([0-9\.]+) pts/) {
