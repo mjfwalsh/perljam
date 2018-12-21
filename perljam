@@ -48,22 +48,19 @@ landscape => 0,
 twoside => 0,
 );
 
-# default binary names depend on operating system
+# We don't need to specify the .exe extension on Windows.
+# List alternative possible names for Ghostscript
 my %exe_name = ();
 if($^O =~ /mswin32/i) {
-	$exe_name{ghostscript} = 'gswin32c.exe';
-	$exe_name{ghostscript2} = 'mgs.exe'; # MiKTeX gs on Windows
-	$exe_name{pdflatex} = 'pdflatex.exe';
-	$exe_name{pdfinfo} = 'pdfinfo.exe';
-	$exe_name{kpsewhich} = 'kpsewhich.exe';
-	$exe_name{file} = 'file.exe';
+	$exe_name{ghostscript} = ['gswin32c', 'mgs', 'gs'];
 } else {
-	$exe_name{ghostscript} = 'gs';
-	$exe_name{pdflatex} = 'pdflatex';
-	$exe_name{pdfinfo} = 'pdfinfo';
-	$exe_name{kpsewhich} = 'kpsewhich';
-	$exe_name{file} = 'file';
+	$exe_name{ghostscript} = ['gs'];
 }
+
+$exe_name{pdflatex} = ['pdflatex'];
+$exe_name{pdfinfo} = ['pdfinfo'];
+$exe_name{kpsewhich} = ['kpsewhich'];
+$exe_name{file} = ['file'];
 
 ############################################################
 ### Process command line options and configuration files ###
@@ -218,35 +215,23 @@ print "done\n" if $opt{verbose};
 
 print "Checking executables..." if $opt{verbose};
 
-if(defined $opt{ghostscript}) {
-	if(-f $opt{ghostscript}) {
-		$opt{ghostscript} = safe_abs_path($opt{ghostscript});
-	} else {
-		$opt{ghostscript} = check_path($opt{ghostscript});
-	}
-} elsif(-f $exe_name{ghostscript}) {
-	$opt{ghostscript} = safe_abs_path($exe_name{ghostscript});
-} else {
-	my $gs = check_path($exe_name{ghostscript});
-
-	if($^O eq 'MSWin32' && !$gs) {
-		$gs = check_path($exe_name{ghostscript2});
-	}
-
-	$opt{ghostscript} = $gs;
-}
-
-foreach my $exec (qw{pdflatex pdfinfo kpsewhich file}) {
+foreach my $exec (qw{ghostscript pdflatex pdfinfo kpsewhich file}) {
 	if(defined $opt{$exec}) {
 		if(-f $opt{$exec}) {
 			$opt{$exec} = safe_abs_path($opt{$exec});
 		} else {
 			$opt{$exec} = check_path($opt{$exec});
 		}
-	} elsif(-f $exe_name{$exec}) {
-		$opt{$exec} = safe_abs_path($exe_name{$exec});
 	} else {
-		$opt{$exec} = check_path($exe_name{$exec});
+		foreach my $e (@{ $exe_name{$exec} }) {
+			if(-f $e) {
+				$opt{$exec} = safe_abs_path($e);
+				last;
+			} else {
+				$opt{$exec} = check_path($e);
+				last if $opt{$exec};
+			}
+		}
 	}
 }
 
