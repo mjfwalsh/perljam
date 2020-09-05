@@ -1,6 +1,23 @@
 #!/usr/bin/perl -w
 
-use 5.012; # ie v5.12 (for the most part its tested under v5.18)
+#	perljam - A port of pdfjam by David Firth written in Perl.
+#	Copyright (C) 2020  Michael J. Walsh
+
+#	This programme is free software: you can redistribute it and/or modify
+#	it under the terms of the GNU General Public Licence as published by
+#	the Free Software Foundation, either version 3 of the Licence, or any
+#	later version.
+
+#	This program is distributed in the hope that it will be useful,
+#	but WITHOUT ANY WARRANTY; without even the implied warranty of
+#	MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#	GNU General Public Licence for more details.
+
+#	You can find a copy of the GNU General Public Licence at
+#	<https://www.gnu.org/licenses/>. And if that doesn't work
+#	try Googling it!
+
+use 5.012;
 
 # core modules
 use strict;
@@ -13,8 +30,8 @@ use File::Glob ':bsd_glob';
 # other modules
 use File::Which ();
 
-# Perl on Win32 doesn't support open LIST, so I use open3 to avoid make allow filename
-# safe operations. This can create problems for line endings.
+# Perl on Win32 doesn't support open LIST, so I use open3 to make filename safe
+# operations. This can create problems for line endings.
 
 # While Windows traditionally uses CRLF endings, some of the applications this script
 # uses output unix LF endings instead.
@@ -51,10 +68,10 @@ twoside => 0,
 # We don't need to specify the .exe extension on Windows.
 # List alternative possible names for Ghostscript
 my %exe_name = ();
-if($^O =~ /mswin32/i) {
-	$exe_name{ghostscript} = ['gswin32c', 'mgs', 'gs'];
+if($^O =~ /mswin32/i || $^O =~ /cygwin/i) {
+	$exe_name{ghostscript} = ['gswin32c', 'gswin64c', 'mgs', 'gs'];
 } else {
-	$exe_name{ghostscript} = ['gs'];
+	$exe_name{ghostscript} = ['gs', 'gsc'];
 }
 
 $exe_name{pdflatex} = ['pdflatex'];
@@ -99,28 +116,51 @@ my $args = process_args_from_cmd_line($param_guide);
 
 if($args->{help}) {
 	print_help();
-	exit;
+	exit 0;
 }
 
 if($args->{version}) {
 	print "\n" if $opt{verbose};
 	print "Version: $version\n";
-	exit;
+	exit 0;
 }
 
 # check vanilla
-if(!$args->{vanilla} && defined $ENV{PERLJAMCONFIG}) {
-	my @configfiles = grep { -f } split(/:/, $ENV{PERLJAMCONFIGFILE});
+if(!$args->{vanilla} && defined $ENV{PERLJAMCONFIGFILE}) {
+	my @configfiles;
+
+	if($^O eq 'MSWin32') {
+		@configfiles = split(/;/, $ENV{PERLJAMCONFIGFILE});
+		foreach (@configfiles) {
+			s!^~(/|\\)!$ENV{HOME}$1!g;
+		}
+	} else {
+		@configfiles = split(/:/, $ENV{PERLJAMCONFIGFILE});
+		foreach (@configfiles) {
+			s!^~/!$ENV{HOME}/!g;
+		}
+	}
+
+	@configfiles = grep { -f } @configfiles;
+
 	if($#configfiles > -1) {
 		my $file_args = process_args_from_file($param_guide, @configfiles);
+
 		# now merge hashes: cmd_args wallop file_args
-		$args = [%$file_args, %$args];
+		my %tmp_args = (%$file_args, %$args);
+		$args = \%tmp_args;
 	}
 }
 
-# avoid having to write paper after known paper types
-if($args->{paper} && $args->{paper} =~ m/^([a-zA-Z][0-9]|letter|executive|legal)$/) {
-	$args->{paper} .= 'paper';
+# paper sizes
+if(defined $args->{paper}) {
+	if($args->{paper} =~ m/^([a-zA-Z][0-9]|letter|executive|legal)$/) {
+		# avoid having to write paper after known paper types
+		$args->{paper} .= 'paper';
+	} else {
+		# Add curly braces and a comma if necessary
+		$args->{paper} =~ s/^([0-9\.]+[a-z]*)[ ,]([0-9\.]+[a-z]*)$/\{$1,$2\}/;
+	}
 }
 
 # split into two groups
@@ -174,7 +214,11 @@ while(my $arg = shift @ARGV) {
 
 	push @input_files, $file;
 }
-die "\nNo input files! Quitting\n" if $#input_files < 0;
+
+if($#input_files < 0) {
+	print_help();
+	exit 1;
+}
 
 if(!$opt{batch} && $#input_files > 0 && $opt{keepinfo}) {
 	die "\nWe can't keep info for more than one pdf file when not in batch mode\n";
@@ -299,7 +343,7 @@ if($#prerequisites > -1) {
 	push @prerequisites, "This could be a PATH issue.";
 	print join "\n", @prerequisites;
 	print "\n";
-	exit;
+	exit 1;
 }
 
 print "done\n" if $opt{verbose};
@@ -324,7 +368,12 @@ if($opt{margin}) {
 
 		foreach my $margin (@margins) {
 			if($margin =~ m/^(-?[0-9\.]+)(mm|pc|cm|in|pt|bp|)$/) {
-				$margin = int(($1 * $units{$2}) + 0.5);
+				my $bps = $1 * $units{$2};
+				if($bps < 0) {
+					$margin = int($bps - 0.5);
+				} else {
+					$margin = int($bps + 0.5);
+				}
 			} else {
 				die "Malformed --margin param\n";
 			}
@@ -388,11 +437,11 @@ for my $file (@input_files) {
 		$file->{texname} = "input.pdf";
 		my $temp_file = "$tmpdir/input.pdf";
 
-		open(REDIR, ">$temp_file") || die "Failed to create temp file: $temp_file\n";
+		open(my $REDIR, ">$temp_file") || die "Failed to create temp file: $temp_file\n";
 		binmode STDIN;
-		binmode REDIR;
-		print REDIR <STDIN>;
-		close REDIR;
+		binmode $REDIR;
+		print $REDIR <STDIN>;
+		close $REDIR;
 	} elsif($^O eq 'MSWin32') {
 		# use special windows short names with forward slashes to avoid complicated
 		# filename escaping on windows systems
@@ -430,8 +479,8 @@ for my $file (@input_files) {
 
 	if($opt{keepinfo}) {
 		my %pdfinfo;
-		open3(0, \*PDFINFO, 0, $opt{pdfinfo}, $file->{source});
-		while(my $line = <PDFINFO>) {
+		open3(0, my $PDFINFO, 0, $opt{pdfinfo}, $file->{source});
+		while(my $line = <$PDFINFO>) {
 			$line =~ s/[\x0D\x0A]+$//; # chomp
 			next unless $line =~ m/^([^:]*): *(.+)$/;
 			my ($k, $v) = ($1, $2);
@@ -439,7 +488,7 @@ for my $file (@input_files) {
 			$v =~ s/^\s*(.*?)\s*$/$1/g;
 			$pdfinfo{$k} = $v;
 		}
-		close PDFINFO;
+		close $PDFINFO;
 
 		# Avoid errors due to undefined fields
 		foreach my $k ('title', 'author', 'subject', 'keywords', 'pages', 'page size') {
@@ -535,17 +584,17 @@ if($opt{batch}) {
 	foreach my $file (@input_files) {
 		chdir $file->{tmpdir};
 
-		open TEMPLATE, '>a.tex' || die "Failed to create tex file: " .  getcwd() . "/a.tex\n";
-		print TEMPLATE $tex_file_content;
+		open my $TEMPLATE, '>a.tex' || die "Failed to create tex file: " .  getcwd() . "/a.tex\n";
+		print $TEMPLATE $tex_file_content;
 
 		if($texpackages{'hyperref.sty'}) {
-			print TEMPLATE compile_pdf_info(\%opt, $file);
+			print $TEMPLATE compile_pdf_info(\%opt, $file);
 		}
 
-		print TEMPLATE $tex_file_content2;
-		print TEMPLATE includepdf($file, 'pages', 'viewport');
-		print TEMPLATE "\\end{document}\n";
-		close TEMPLATE;
+		print $TEMPLATE $tex_file_content2;
+		print $TEMPLATE includepdf($file, 'pages', 'viewport');
+		print $TEMPLATE "\\end{document}\n";
+		close $TEMPLATE;
 
 		callpdflatex(); # works on current directory
 
@@ -557,19 +606,19 @@ if($opt{batch}) {
 } else {
 	chdir $tmpdir;
 
-	open TEMPLATE, '>a.tex' || die "Failed to create tex file: " .  getcwd() . "/a.tex\n";
-	print TEMPLATE $tex_file_content;
+	open my $TEMPLATE, '>a.tex' || die "Failed to create tex file: " .  getcwd() . "/a.tex\n";
+	print $TEMPLATE $tex_file_content;
 
 	if($texpackages{'hyperref.sty'}) {
-		print TEMPLATE compile_pdf_info(\%opt, $input_files[0]);
+		print $TEMPLATE compile_pdf_info(\%opt, $input_files[0]);
 	}
 
-	print TEMPLATE $tex_file_content2;
+	print $TEMPLATE $tex_file_content2;
 	foreach my $file (@input_files) {
-		print TEMPLATE  includepdf($file, 'pages', 'viewport');
+		print $TEMPLATE  includepdf($file, 'pages', 'viewport');
 	}
-	print TEMPLATE "\\end{document}\n";
-	close TEMPLATE;
+	print $TEMPLATE "\\end{document}\n";
+	close $TEMPLATE;
 
 	callpdflatex(); # works on current directory
 
@@ -590,6 +639,8 @@ if($opt{batch}) {
 }
 chdir $start_cwd;
 
+exit 0;
+
 #########################
 ###    Subroutines    ###
 #########################
@@ -601,22 +652,178 @@ sub kpsewhich {
 		$texpackages{$k} = 0;
 	}
 
-	open3(0, \*CMD, \*CMD,  $opt{kpsewhich}, keys %texpackages);
-	while(my $file = <CMD>) {
+	my $CMD;
+	open3(0, $CMD, $CMD,  $opt{kpsewhich}, keys %texpackages);
+	while(my $file = <$CMD>) {
 		$file =~ s/[\x0D\x0A]+$//; # chomp
 		$file =~ s|^.*/||;
 		if(exists $texpackages{$file}) {
 			$texpackages{$file} = 1;
 		}
 	}
-	close CMD;
+	close $CMD;
 
 	return %texpackages;
 }
 
 # Documentation
 sub print_help {
-	print "I should really write some documentations sometime...\n";
+	print <<"MANPAGE";
+Usage: perljam [OPTIONS] [--] [FILE [SEL]] [FILE [SEL]]...
+
+perljam is a front end to the pdfpages LaTeX package. Its based on perljam
+and mostly takes the same command line options.
+
+where
+
+  FILE     Any pdf, jpeg and png file. Set the filename to - or stdin to read from
+           standard input which is also the default option.
+
+  SEL      Optional pages selection for the preceding document.
+  -        All he pages in a document (default)
+  4-6      A range of pages
+  5,7,3    A selection
+  {}       Add a blank page
+  last     The last page
+  5-       Same as 5-last
+
+  --       End options and beginning of files and selectors
+
+  OPTIONS are pdfpages specifications in the form --KEY VALUE (see
+   below), or
+
+     --help  (or -h, or -u)
+                  Output this help text.
+     --version (or -V)
+                  Output the version number of perljam.
+     --quiet  (or -q)
+                  Suppress verbose commentary on progress.
+     --batch
+                  Run perljam sequentially on each input file in turn, and
+                  produce a separate output file for each input, rather
+                  than the default behaviour (which concatonates multiple
+                  input files into a single output file).
+     --crop
+                  Use Ghostscript to crop whitespace from pdfs before processing.
+                  You may wish to use this in conjunction with --margins to leave
+                  some whitespace when nuping.
+     --margins <all>
+     --margins "<side margin> <top/bottom margin>"
+     --margins "<left> <top> <right> <bottom>"
+                  Add whitespace around page. Usefule when cropping to maintain
+                  some white space. Outside of cropping executes an inverse trim.
+                  The following measurement are supported: mm, pc, cm, in, pt & bp.
+                  Defaults to TeX points (1 pt = 1/72.12 inch)
+     --outfile PATH  (or -o PATH)
+                  Specifies where the output file(s) will go.  If PATH is an
+                  existing directory, perljam will write its output PDF
+                  file(s) there.
+     --suffix STRING
+                  Specifies a suffix for output file names, to be used when
+                  --outfile is either (a) a directory, or
+                                      (b) not specified in a --batch call.
+                  A good STRING should be descriptive: for example,
+                           --suffix rotated
+                  would append the text -rotated to the name of the input
+                  file in order to make the output file name, as in
+                  myfile-rotated.pdf.  The STRING must not have zero length.
+                  [Defaults to: suffix=$opt{suffix}]
+     --checkfiles
+     --no-checkfiles
+                  Check the output pdf file using unix's file command
+                  [Defaults to: checkfiles=$opt{checkfiles}]
+     --preamble STRING
+                  Append the supplied STRING to the preamble of the LaTeX
+                  source file(s), immediately before the \\begin{document}
+                  line.  An example:
+                      perljam --nup 2x2 myfile.pdf -o myfile-4up.pdf \\
+                          --preamble '\\usepackage{fancyhdr} \\pagestyle{fancy}'
+                  The --preamble option can be used, for example, to load
+                  LaTeX packages and/or to set global options.  If --preamble
+                  is used more than once in the call, the supplied preamble
+                  strings are simply concatenated.
+     --keepinfo
+     --no-keepinfo
+                  Preserve (or not) Title, Author, Subject and Keywords in the
+                  output PDF file.  This requires the pdfinfo utility, from
+                  poppler or xpdf, and the LaTeX hyperref package.
+                  [Defaults to: keepinfo=$opt{keepinfo}]
+     --pdftitle STRING
+     --pdfauthor STRING
+     --pdfsubject STRING
+     --pdfkeywords STRING
+                  Provide text for the  Title, Author, Subject and Keywords
+                  in the output PDF file.  Requires the  LaTeX hyperref
+                  package.  These options, individually, over-ride --keepinfo.
+     --landscape
+     --no-landscape
+                  Specify landscape page orientation (or not) in the
+                  output PDF file.
+                  [Defaults to: landscape=$opt{keepinfo}]
+     --twoside
+     --no-twoside
+                  Specify (or not) the twoside document class option.
+                  [Defaults to: twoside=$opt{keepinfo}]
+     --paper PAPERSPEC  (or simply --PAPERSPEC)
+                  Specify a LaTeX paper size, for example --paper a4paper or
+                  simply --a4paper for A4 paper. If the LaTeX geometry package
+                  is installed, a wider range of paper sizes is available.
+                  [Defaults to: paper=$opt{paper}]
+     --papersize 'WIDTH HEIGHT'
+                  Specify a custom paper size, e.g.,
+                      --papersize '10in 18cm'
+     --pagecolor RGBSPEC
+                  Specify a background colour for the output pages.  The
+                  RGBSPEC must be a comma-separated trio of integers
+                  between 0 and 255.  An example:
+                         --pagecolor 150,200,150
+                  [Default is no background colour]
+     --tidy
+     --no-tidy
+                  Specify whether the temporary directory created by
+                  perljam should be deleted.  Use --no-tidy to help debug
+                  most errors.
+                  [Defaults to: tidy=$opt{tidy}]
+     --vanilla
+                  Suppress the reading of any site-wide or user-specific
+                  configuration files.
+     --KEY VALUE
+                  Specify options to \\includepdfmerge, in the LaTeX
+                  pdfpages package.  Here KEY is the name of any of the
+                  many options for \\includepdfmerge, and VALUE is a
+                  corresponding value.  Examples are
+                      --nup 2x1     (for 2-up side-by-side imposition)
+                      --scale 0.7   (to scale all input pages to 70% size)
+                      --offset 1cm 0.5cm
+                                    (to offset all pages -- note the quotes!)
+                      --frame true  (to put a frame round each input page)
+                      --trim 1cm 2cm 1cm 2cm --clip true
+                                    (to trim those amounts from left, bottom,
+                                     right and top, respectively, of input
+                                     pages)
+                  Where an option ends in '*' it can be replaced by '2'.
+
+                  For more information see the manual for
+                  the pdfpages package, at
+                  http://www.ctan.org/tex-archive/macros/latex/contrib/pdfpages
+
+Unlike pdfjam, perljam has no default paths for configuration files. but if
+you wish to use one you can set the PERLJAMCONFIGFILE environmental variable.
+Multiple files can be specified using a semi-colon on windows or a colon on
+other systems. Such as
+
+export PERLJAMCONFIGFILE='~/.perljam.conf:/etc/share/perljam.conf'
+
+Anything that can be passed on the command line can be put in a configuration file.
+For Example:
+
+paper legal
+no-tidy
+pdfauthor Yours Truly
+MANPAGE
+;
+
+
 }
 
 # get a unique filename for output - loops until it finds one
@@ -742,8 +949,8 @@ sub process_args_from_file {
 	# now process configuration file
 	my %params_from_file = ();
 	while(my $configfile = shift @configfiles) {
-		open CONFIG, '<', $configfile;
-		while(my $line = <CONFIG>) {
+		open my $CONFIG, '<', $configfile;
+		while(my $line = <$CONFIG>) {
 			$line =~ s/[\x0D\x0A]+$//; # chomp
 			$line =~ s|#.*$||; # remove comments
 			$line =~ s|^\s*(.+?)\s*$|$1|; # trim whitespace
@@ -784,7 +991,7 @@ sub process_args_from_file {
 
 			$params_from_file{$key} = $value;
 		}
-		close CONFIG;
+		close $CONFIG;
 	}
 
 	return \%params_from_file;
@@ -812,18 +1019,18 @@ sub callpdflatex {
 	# this subroutine relies on the current working directory being correctly set
 	print "Calling pdflatex...\n"  if $opt{verbose};
 
-	open3(0, \*CMD, 0, $opt{pdflatex}, 'a.tex');
+	open3(0, my $CMD, 0, $opt{pdflatex}, 'a.tex');
 
 	if($opt{verbose}) {
-		print <CMD>;
+		print <$CMD>;
 	} else {
-		open MSG, '>a.msg';
-		binmode MSG;
-		print MSG <CMD>;
-		close MSG;
+		open my $MSG, '>a.msg';
+		binmode $MSG;
+		print $MSG (<$CMD>);
+		close $MSG;
 	}
 
-	if(close CMD && -f 'a.pdf') {
+	if(close $CMD && -f 'a.pdf') {
 		print "done\n" if $opt{verbose};
 	} else {
 		my $cwd = getcwd();
@@ -838,9 +1045,9 @@ sub move_output {
 	if($opt{checkfiles}) {
 		my $output;
 		# run file command on output
-		open3(0, \*CMD, 0, $opt{file}, '-b', 'a.pdf');
-		$output = <CMD>;
-		close CMD;
+		open3(0, my $CMD, 0, $opt{file}, '-b', 'a.pdf');
+		$output = <$CMD>;
+		close $CMD;
 		$output =~ s/[\x0D\x0A]+$//; # chomp
 
 		if($output !~ m/^PDF document/) {
@@ -899,19 +1106,20 @@ sub do_crop {
 	push @gs_cmdpipe, '-c', 'save', 'pop', '-f', $file->{source};
 
 	# run ghostscript
-	open3(0, \*CMD, \*CMD, @gs_cmdpipe) or die "Cannot call ghostscript!\n";
+	my $CMD;
+	open3(0, $CMD, $CMD, @gs_cmdpipe) or die "Cannot call ghostscript!\n";
 
 	print "Running ghostscript for crop..." if $opt{verbose};
 
 	my @bb;
 	$bb[ $first - 1 ] = (); # dummy to align index with logical page numbers
-	while (my $line = <CMD>) {
+	while (my $line = <$CMD>) {
 		if($line =~ /^%%HiResBoundingBox: *(-?[0-9\.]+) (-?[0-9\.]+) (-?[0-9\.]+) (-?[0-9\.]+)/) { # ignore CRs
 			print $line if $opt{verbose};
 			push @bb, [$1, $2, $3, $4];
 		}
 	}
-	close(CMD);
+	close $CMD;
 
 	if($#bb == $first - 1) {
 		die "\nCrop failed to process any pages\n";
